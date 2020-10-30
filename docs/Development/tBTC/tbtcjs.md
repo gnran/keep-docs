@@ -1,0 +1,161 @@
+--- 
+order: 2
+---
+
+# tBTC.js Setup
+
+:::warning
+The source code related to this section can be found in [Keep-tBTC.js](https://github.com/keep-network/tbtc.js)
+:::
+
+`tbtc.js` provides JS bindings to the tBTC system. The [tBTC system](https://tbtc.network/) is a bonded, multi-federated peg made up of many deposits backed by single-use BTC wallets to enable their value’s corresponding usage on the Ethereum chain, primarily through the minting of a TBTC ERC20 token whose supply is guaranteed to be backed by at least 1 BTC per TBTC in circulation.
+
+## Depending or Installing
+
+`tbtc.js` is still prerelease software, and is aimed at the current testnet deployment of the tBTC system on Ropsten. This package and repo are in flux and will increase in version number until hitting 1.0; minor version bumps currently will aim at different versions of Ropsten contracts. Older versions of Ropsten contracts will not be maintained, so in case of issues, make sure there hasn’t been a release.
+
+API stability is not guaranteed, but the API is likely ~90% complete.
+
+## Usage
+
+You need two things to use `tbtc.js`:
+
+* A working Web3 provider pointed at Ropsten with a funded default account.
+
+* A connection to a working Electrum server pointed at the Bitcoin testnet.
+
+We are running a public testnet Electrum server currently, but its availability is not guaranteed as it’s not set up for production traffic, so keep an eye out for flakiness. The configuration for the tBTC test Electrum server is below.
+
+### Initializing the TBTC configuration
+
+Once you’ve required tbtc.js, you can get a handle to a configured TBTC setup:
+
+```js
+import TBTC from './src/TBTC.js';
+
+const tbtc = await TBTC.withConfig({
+    web3: web3,
+    bitcoinNetwork: "testnet",
+    electrum: {
+        "testnet": {
+            "server": "electrumx-server.test.tbtc.network",
+            "port": 50002,
+            "protocol": "ssl"
+        },
+        "testnetWS": {
+            "server": "electrumx-server.test.tbtc.network",
+            "port": 50003,
+            "protocol": "ws"
+        }
+    },
+})
+```
+
+### Creating and Funding a Deposit
+
+With a configured handle to the system, you can fetch the `DepositFactory` and have a look at available lot sizes, in satoshis:
+
+```js
+const lotSizes = await tbtc.Deposit.availableSatoshiLotSizes()
+```
+
+Then you can make a deposit with any of those; let’s start with the smallest:
+
+```js
+const deposit = await tbtc.Deposit.withSatoshiLotSize(lotSizes[0])
+```
+
+At this point, you have a handle to a deposit that is in the process of initializing. In the background, a signer group is being selected and undergoing distributed key generation, at which point it will publish its public key to the Ethereum chain. Once that key is published, in the current testnet version, you need to poke the deposit to fetch it from the signers and store it internally. Then you can generate a Bitcoin address from that public key, use that to send a transaction to the generated address on the Bitcoin chain. Then you have to wait for that transaction to accumulate sufficient work (on the testnet, that’s 1 confirmation’s worth), and finally submit a proof to the Ethereum chain that your transaction was sufficiently confirmed. Then the deposit becomes active and you can mint TBTC.
+
+That’s a lot, and it’s annoying, so you can do all of the interchain coordination with one call:
+
+```js
+deposit.autoSubmit()
+```
+
+This will wait for the public key from the signers, submit it to the Ethereum chain, generate the Bitcoin address, watch for the Bitcoin transaction, wait for the right confirmations, and submit the proof. Your code just needs to listen for the Bitcoin address and present it on the console:
+
+```js
+deposit.onBitcoinAddressAvailable(async (address) => {
+    const lotSize = await deposit.getLotSizeSatoshis()
+    console.log(
+        "\tGot deposit address:", address,
+        "; fund with:", lotSize.toString(), "satoshis please.",
+    )
+    console.log("Now monitoring for deposit transaction...")
+})
+```
+
+And then you can send Bitcoin to that address when it’s printed.
+
+Once the deposit is active, you can mint TBTC. You can wait for that event and react accordingly:
+
+```js
+deposit.onActive(async (deposit) => {
+    console.log("Deposit is active, minting...")
+    const tbtcBits = await deposit.mintTBTC()
+    console.log(`Minted ${tbtcBits} TBTC bits!`)
+    // or if you want some TDT action
+    // deposit.depositTokenContract.transfer(someLuckyContract)
+})
+```
+
+Minting TBTC gives deposit ownership to the tBTC Vending Machine, though this is largely abstracted away here.
+
+### Redeeming a Deposit
+
+Once you have enough TBTC, you can redeem an existing deposit. First, you want to look up the deposit you’re trying to redeem:
+
+```js
+const depositToRedeem = await tbtc.Deposit.withAddress("0x<existing deposit address>")
+```
+
+Then, you can call requestRedemption and pass it a testnet P2WPKH address:
+
+```js
+const redemption = await deposit.requestRedemption("tb...")
+```
+
+Like funding, redemption requires a bit of coordination between the Ethereum and Bitcoin chains: the client has to construct an unsigned Bitcoin transaction from the signer wallet to the designated redeemer address, the signers must generate a signature for that transaction, and then the client must broadcast that transaction to the Bitcoin chain. Finally, after sufficient work has been included on the Bitcoin chain, the client must notify the Ethereum chain that the deposit is redeemed by submitting a proof to the deposit.
+
+Once again, that can be automated away by a single call:
+
+```js
+redemption.autoSubmit()
+```
+
+If you want to do something once the redemption is completed, you can use the `onWithdrawn` handler, which receives the transaction ID/hash of the Bitcoin transaction that redeemed the deposit:
+
+```js
+redemption.onWithdrawn((transactionID) => {
+    console.log(
+        `Redeemed deposit ${deposit.address} with Bitcoin transaction ` +
+        `${transactionID}.`
+    )
+})
+```
+
+### Managing Lifecycles Manually
+
+Deposits and redemptions also provide hooks to manage the lifecycle manually for those who are more adventurous and don’t want to opt in to auto-submission. All functionality used by the funding and redemption processes is exposed publicly. For more details, you are encouraged to look at [`src/Deposit.js`](https://github.com/keep-network/tbtc.js/blob/master/src/Deposit.js) and [`src/Redemption.js`](https://github.com/keep-network/tbtc.js/blob/master/src/Redemption.js) (until more details are filled in here…​).
+
+### Interacting with Ethereum Contracts Directly
+
+Handles to the Ethereum `TruffleContract` instances are directly available on the `tbtc.Deposit` object. Here is how these map to Solidity files in the tBTC repository:
+
+* `tbtc.Deposit.system()`: [`TBTCSystem.sol`](https://github.com/keep-network/tbtc/blob/master/solidity/contracts/system/TBTCSystem.sol)
+
+* `tbtc.Deposit.depositFactory()`: [`DepositFactory.sol`](https://github.com/keep-network/tbtc/blob/master/solidity/contracts/proxy/DepositFactory.sol)
+
+* `tbtc.Deposit.token()`: [`TBTCToken.sol`](https://github.com/keep-network/tbtc/blob/master/solidity/contracts/system/TBTCToken.sol)
+
+* `tbtc.Deposit.depositToken()`: [`TBTCDepositToken.sol`](https://github.com/keep-network/tbtc/blob/master/solidity/contracts/system/TBTCDepositToken.sol)
+
+* `tbtc.Deposit.vendingMachine()`: [`VendingMachine.sol`](https://github.com/keep-network/tbtc/blob/master/solidity/contracts/system/VendingMachine.sol)
+
+* `tbtc.Deposit.feeRebateToken()`: [`FeeRebateToken.sol`](https://github.com/keep-network/tbtc/blob/master/solidity/contracts/system/FeeRebateToken.sol)
+
+Finally, the per-deposit contract is available directly on the returned deposit; in the example code above, this would be `deposit.contract`. This corresponds to the [`Deposit.sol`](https://github.com/keep-network/tbtc/blob/master/solidity/contracts/deposit/Deposit.sol) file in the tBTC system.
+
+
+

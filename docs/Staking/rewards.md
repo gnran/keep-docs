@@ -4,7 +4,7 @@ order: 2
 
 # Staking Rewards
 
-The Keep Network has a non-inflationary rewards model, and all rewards are in KEEP, ETH and/or tBTC.
+The Keep Network has a non-inflationary rewards model, and all rewards are in KEEP, ETH and/or tBTCs.
 
 ## Overview
 
